@@ -87,7 +87,7 @@ class EchoIterableDataset(IterableDataset):
                 yield self._process_single(path)
             except Exception:
                 # Skip corrupted file but continue streaming
-                traceback.print_exc()
+                # traceback.print_exc()
                 continue
 
     @staticmethod
@@ -140,13 +140,13 @@ def main():
             views = classify_first_frames(vids)
         except Exception:
             failed.extend(keys)
-            traceback.print_exc()
+            # traceback.print_exc()
             continue
         for k, m, v in zip(keys, metas, views):
             results[k] = {"metadata": m, "predicted_view": v}
         print(f"✔️  Finished batch {batch_idx + 1}: {len(keys)} files, total done {len(results)}")
-        if len(results) % FLUSH_EVERY == 0:
-            _flush(results, failed)
+        # if len(results) % FLUSH_EVERY == 0:
+        _flush(results, failed)
 
     _flush(results, failed)
     print("✅  Complete run. successes=", len(results), "failures=", len(failed))
