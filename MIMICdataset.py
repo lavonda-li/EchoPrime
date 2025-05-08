@@ -21,9 +21,10 @@ OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 32                      # safe on 24 GB w/ FP16; tune for your GPU
-NUM_WORKERS  = min(32, os.cpu_count() or 1)
-FLUSH_EVERY  = 256                    # serialise results every N samples
+BATCH_SIZE   = 64                      # safe on 24 GB w/ FP16; tune for your GPU
+NUM_WORKERS  = min(24, os.cpu_count() or 1)
+FLUSH_EVERY  = 512                    # serialise results every N samples
+prefetch_factor = 8   
 
 FRAMES_TAKE  = 32
 FRAME_STRIDE = 2
@@ -43,7 +44,7 @@ if torch.__version__ >= "2":
     model = torch.compile(model)          # fuse + optimise
 
 @torch.inference_mode()
-@torch.cuda.amp.autocast(dtype=torch.float16)
+@torch.cuda.amp.autocast(enabled=True, dtype=torch.float16)
 def classify_first_frames(videos: torch.Tensor) -> List[str]:
     """Predict coarse view of batch (uses only first frame)."""
     logits = model(videos[:, :, 0])  # [B,C,H,W]
@@ -109,6 +110,7 @@ def main() -> None:
                     num_workers=NUM_WORKERS,
                     pin_memory=True,
                     persistent_workers=True,
+                    prefetch_factor=prefetch_factor,
                     collate_fn=collate)
 
     results: Dict[str, Any] = {}
