@@ -3,13 +3,13 @@ import json
 import os
 import traceback
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Dict, Any, Iterable, Tuple, List
 
 import numpy as np
 import pydicom
 import torch
 import torchvision
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
 import utils
@@ -24,7 +24,7 @@ DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE   = 64
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 FLUSH_EVERY  = 512
-PREFETCH     = 8
+PREFETCH     = 16
 
 FRAMES_TAKE  = 32
 FRAME_STRIDE = 2
@@ -50,71 +50,91 @@ def classify_first_frames(videos: torch.Tensor) -> List[str]:
     idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
-# ─── 3️⃣ DISCOVER ALREADY‑DONE FOLDERS ────────────────────────────────────────
+# ─── 3️⃣ DISCOVER COMPLETED FOLDERS ────────────────────────────────────────────
 DONE_DIRS = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
 if DONE_DIRS:
     print(f"⚠️  Detected {len(DONE_DIRS):,} completed folders; they will be skipped.")
+    for d in sorted(DONE_DIRS):
+        print(f"✔️  {d} already done — skipping.")
 
-# ─── 4️⃣ DATASET ──────────────────────────────────────────────────────────────
-class EchoDataset(Dataset):
-    def __init__(self, root: Path):
-        self.paths = [p for p in root.rglob("*.dcm")
-                      if p.parent.relative_to(root).as_posix() not in DONE_DIRS]
-        self.paths.sort()
+# ─── 4️⃣ ITERABLE DATASET ──────────────────────────────────────────────────────
+class EchoIterableDataset(IterableDataset):
+    """Streams DICOM files lazily; each worker walks a shard of the tree."""
 
-    def __len__(self):
-        return len(self.paths)
+    def __iter__(self) -> Iterable[Tuple[torch.Tensor, Dict[str, Any], str]]:
+        worker_info = torch.utils.data.get_worker_info()
+        # Determine which slice of folders this worker will process
+        if worker_info is None:
+            # single‑process – treat entire tree as one shard
+            paths = list(MOUNT_ROOT.rglob("*.dcm"))
+        else:
+            # multi‑worker – split top‑level patient folders evenly
+            patients = sorted([p for p in MOUNT_ROOT.iterdir() if p.is_dir()])
+            per_worker = len(patients) // worker_info.num_workers
+            remainder  = len(patients) % worker_info.num_workers
+            start = worker_info.id * per_worker + min(worker_info.id, remainder)
+            end   = start + per_worker + (1 if worker_info.id < remainder else 0)
+            assigned = patients[start:end]
+            paths = []
+            for pat in assigned:
+                paths.extend(pat.rglob("*.dcm"))
 
-    def __getitem__(self, idx):
-        path = self.paths[idx]
+        for path in paths:
+            rel_folder = path.parent.relative_to(MOUNT_ROOT).as_posix()
+            if rel_folder in DONE_DIRS:
+                continue  # whole folder already processed
+            try:
+                yield self._process_single(path)
+            except Exception:
+                # Skip corrupted file but continue streaming
+                traceback.print_exc()
+                continue
+
+    @staticmethod
+    def _process_single(path: Path) -> Tuple[torch.Tensor, Dict[str, Any], str]:
         dcm  = pydicom.dcmread(path, force=True)
         meta = {el.name: el.repval for el in dcm}
         px   = dcm.pixel_array
-
         if px.ndim < 3 or px.shape[2] == 3:
             raise ValueError(f"Invalid pixel array shape: {px.shape}")
         if px.ndim == 3:
             px = np.repeat(px[..., None], 3, axis=-1)
-
         px = video_utils.mask_outside_ultrasound(px)
         if hasattr(video_utils, "crop_and_scale_batch"):
             vid = video_utils.crop_and_scale_batch(px, out_h=SIZE, out_w=SIZE)
         else:
             vid = np.stack([video_utils.crop_and_scale(f) for f in px])
-
         vid = torch.from_numpy(vid).permute(3, 0, 1, 2).float()
         if vid.shape[1] < FRAMES_TAKE:
             pad = torch.zeros(3, FRAMES_TAKE - vid.shape[1], SIZE, SIZE)
             vid = torch.cat([vid, pad], 1)
         else:
             vid = vid[:, ::FRAME_STRIDE, :, :][:, :FRAMES_TAKE]
-
         vid.sub_(MEAN).div_(STD)
         return vid, meta, str(path.relative_to(MOUNT_ROOT))
 
-
-def collate(batch):
-    vids, metas, keys = zip(*batch)
-    return torch.stack(vids), metas, keys
-
 # ─── 5️⃣ MAIN ─────────────────────────────────────────────────────────────────
 
-def main():
-    ds = EchoDataset(MOUNT_ROOT)
-    if len(ds) == 0:
-        print("✅  Nothing to do – all folders already processed.")
-        return
+def _set_one_thread(_):
+    torch.set_num_threads(1)  # avoid oversubscription in workers
 
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False,
-                    num_workers=NUM_WORKERS, pin_memory=True,
-                    persistent_workers=True, prefetch_factor=PREFETCH,
-                    collate_fn=collate)
+def main():
+    ds = EchoIterableDataset()
+    dl = DataLoader(ds,
+                    batch_size=BATCH_SIZE,
+                    num_workers=NUM_WORKERS,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    prefetch_factor=PREFETCH,
+                    collate_fn=lambda x: tuple(zip(*x)),  # preserve tuple list
+                    worker_init_fn=_set_one_thread)
 
     results: Dict[str, Any] = {}
     failed: List[str] = []
 
-    print(f"🔍  Starting inference on {len(ds):,} files in {len(dl):,} batches of size {BATCH_SIZE:,}")
-    for batch_idx, (vids, metas, keys) in enumerate(tqdm(dl, desc="🔍 inferring", unit="batch")):
+    for batch_idx, batch in enumerate(tqdm(dl, desc="🔍 inferring", unit="batch")):
+        vids, metas, keys = batch
+        vids = torch.stack(list(vids))
         try:
             vids = vids.half().to(DEVICE, non_blocking=True)
             views = classify_first_frames(vids)
@@ -122,13 +142,9 @@ def main():
             failed.extend(keys)
             traceback.print_exc()
             continue
-
         for k, m, v in zip(keys, metas, views):
             results[k] = {"metadata": m, "predicted_view": v}
-
-        # 🖨️  Verbose feedback per iteration
         print(f"✔️  Finished batch {batch_idx + 1}: {len(keys)} files, total done {len(results)}")
-
         if len(results) % FLUSH_EVERY == 0:
             _flush(results, failed)
 
@@ -139,7 +155,6 @@ def main():
 def _flush(results: Dict[str, Any], failed: List[str]):
     out_file = OUTPUT_ROOT / "results.json"
     failed_file = OUTPUT_ROOT / "failed.txt"
-
     if out_file.exists():
         with out_file.open() as f:
             existing = json.load(f)
@@ -147,7 +162,6 @@ def _flush(results: Dict[str, Any], failed: List[str]):
         results_to_write = existing
     else:
         results_to_write = results
-
     with out_file.open("w") as f:
         json.dump(results_to_write, f, indent=2)
     with failed_file.open("w") as f:
