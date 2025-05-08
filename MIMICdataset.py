@@ -51,18 +51,14 @@ def classify_first_frames(videos: torch.Tensor) -> List[str]:
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
 # ─── 3️⃣ DISCOVER ALREADY‑DONE FOLDERS ────────────────────────────────────────
-DONE_DIRS = {
-    p.parent.relative_to(OUTPUT_ROOT).as_posix()  # e.g. "p10/p10001234"
-    for p in OUTPUT_ROOT.rglob("results.json")
-}
+DONE_DIRS = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
 if DONE_DIRS:
-    print(f"⚠️  Skipping {len(DONE_DIRS):,} folders that already have results.json")
+    print(f"⚠️  Detected {len(DONE_DIRS):,} completed folders; they will be skipped.")
 
-# ─── 4️⃣ DATASET (filters out done folders) ────────────────────────────────────
+# ─── 4️⃣ DATASET ──────────────────────────────────────────────────────────────
 class EchoDataset(Dataset):
     def __init__(self, root: Path):
-        all_paths = root.rglob("*.dcm")
-        self.paths = [p for p in all_paths
+        self.paths = [p for p in root.rglob("*.dcm")
                       if p.parent.relative_to(root).as_posix() not in DONE_DIRS]
         self.paths.sort()
 
@@ -74,21 +70,25 @@ class EchoDataset(Dataset):
         dcm  = pydicom.dcmread(path, force=True)
         meta = {el.name: el.repval for el in dcm}
         px   = dcm.pixel_array
+
         if px.ndim < 3 or px.shape[2] == 3:
             raise ValueError(f"Invalid pixel array shape: {px.shape}")
         if px.ndim == 3:
             px = np.repeat(px[..., None], 3, axis=-1)
+
         px = video_utils.mask_outside_ultrasound(px)
         if hasattr(video_utils, "crop_and_scale_batch"):
             vid = video_utils.crop_and_scale_batch(px, out_h=SIZE, out_w=SIZE)
         else:
             vid = np.stack([video_utils.crop_and_scale(f) for f in px])
+
         vid = torch.from_numpy(vid).permute(3, 0, 1, 2).float()
         if vid.shape[1] < FRAMES_TAKE:
             pad = torch.zeros(3, FRAMES_TAKE - vid.shape[1], SIZE, SIZE)
             vid = torch.cat([vid, pad], 1)
         else:
             vid = vid[:, ::FRAME_STRIDE, :, :][:, :FRAMES_TAKE]
+
         vid.sub_(MEAN).div_(STD)
         return vid, meta, str(path.relative_to(MOUNT_ROOT))
 
@@ -113,7 +113,7 @@ def main():
     results: Dict[str, Any] = {}
     failed: List[str] = []
 
-    for vids, metas, keys in tqdm(dl, desc="🔍 inferring", unit="batch"):
+    for batch_idx, (vids, metas, keys) in enumerate(tqdm(dl, desc="🔍 inferring", unit="batch")):
         try:
             vids = vids.half().to(DEVICE, non_blocking=True)
             views = classify_first_frames(vids)
@@ -121,17 +121,24 @@ def main():
             failed.extend(keys)
             traceback.print_exc()
             continue
+
         for k, m, v in zip(keys, metas, views):
             results[k] = {"metadata": m, "predicted_view": v}
+
+        # 🖨️  Verbose feedback per iteration
+        print(f"✔️  Finished batch {batch_idx + 1}: {len(keys)} files, total done {len(results)}")
+
         if len(results) % FLUSH_EVERY == 0:
             _flush(results, failed)
+
     _flush(results, failed)
-    print("✅  Done. successes=", len(results), "failures=", len(failed))
+    print("✅  Complete run. successes=", len(results), "failures=", len(failed))
 
 
 def _flush(results: Dict[str, Any], failed: List[str]):
     out_file = OUTPUT_ROOT / "results.json"
     failed_file = OUTPUT_ROOT / "failed.txt"
+
     if out_file.exists():
         with out_file.open() as f:
             existing = json.load(f)
@@ -139,6 +146,7 @@ def _flush(results: Dict[str, Any], failed: List[str]):
         results_to_write = existing
     else:
         results_to_write = results
+
     with out_file.open("w") as f:
         json.dump(results_to_write, f, indent=2)
     with failed_file.open("w") as f:
