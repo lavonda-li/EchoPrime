@@ -1,179 +1,148 @@
 #!/usr/bin/env python3
-import os
 import json
+import os
 import traceback
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
 
+import numpy as np
+import pydicom  # pylibjpeg rockets the decode speed ⚡️
 import torch
 import torchvision
-import numpy as np
-import pydicom
-from pydicom.pixel_data_handlers.util import convert_color_space
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-import utils
+import utils  # project‑specific helpers (COARSE_VIEWS etc.)
 import video_utils
 
 # ─── 1️⃣ CONFIG ────────────────────────────────────────────────────────────────
-MOUNT_ROOT   = os.path.expanduser("~/mount-folder/MIMIC-Echo-IV")
-OUTPUT_ROOT  = os.path.expanduser("~/inference_output")
-os.makedirs(OUTPUT_ROOT, exist_ok=True)
+MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
+OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# GPU & batching
-device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 16
-MAX_WORKERS  = min(32, os.cpu_count() or 1)
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE   = 32                      # safe on 24 GB w/ FP16; tune for your GPU
+NUM_WORKERS  = min(32, os.cpu_count() or 1)
+FLUSH_EVERY  = 256                    # serialise results every N samples
 
-# video preprocess params
-frames_to_take = 32
-frame_stride   = 2
-video_size     = 224
-mean = torch.tensor([29.110628, 28.076836, 29.096405], device=device).reshape(3,1,1,1)
-std  = torch.tensor([47.989223, 46.456997, 47.20083],  device=device).reshape(3,1,1,1)
+FRAMES_TAKE  = 32
+FRAME_STRIDE = 2
+SIZE         = 224
+MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3, 1, 1, 1)
+STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3, 1, 1, 1)
 
-# ─── 2️⃣ LOAD VIEW CLASSIFIER ──────────────────────────────────────────────────
-ckpt = torch.load("model_data/weights/view_classifier.ckpt", map_location=device)
-state_dict = {k[6:]: v for k, v in ckpt["state_dict"].items()}
+# ─── 2️⃣ MODEL ────────────────────────────────────────────────────────────────
+ckpt = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
+state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
+model = torchvision.models.convnext_base()
+model.classifier[-1] = torch.nn.Linear(model.classifier[-1].in_features,
+                                       len(utils.COARSE_VIEWS))
+model.load_state_dict(state, strict=False)
+model = model.to(DEVICE).half().eval()   # FP16 weights
+if torch.__version__ >= "2":
+    model = torch.compile(model)          # fuse + optimise
 
-view_classifier = torchvision.models.convnext_base()
-view_classifier.classifier[-1] = torch.nn.Linear(
-    view_classifier.classifier[-1].in_features,
-    len(utils.COARSE_VIEWS),
-)
-view_classifier.load_state_dict(state_dict)
-view_classifier.to(device).eval()
-for p in view_classifier.parameters():
-    p.requires_grad = False
-
-# ─── 3️⃣ SAFE METADATA SERIALIZATION ───────────────────────────────────────────
-def _safe(val):
-    """Convert DICOM values to JSON-serializable Python types."""
-    import numpy as _np
-    if isinstance(val, (bytes, bytearray)):
-        return val.decode(errors="ignore")
-    if isinstance(val, _np.ndarray):
-        return val.tolist()
-    try:
-        json.dumps(val)
-        return val
-    except Exception:
-        return str(val)
-
-# ─── 4️⃣ DICOM → TENSOR + METADATA ─────────────────────────────────────────────
-def process_single_dicom(dcm_path):
-    dcm = pydicom.dcmread(dcm_path)
-    meta = {element.name: element.repval for element in dcm}
-    pixels = dcm.pixel_array
-
-    # exclude images like (600,800) or (600,800,3)
-    if pixels.ndim < 3 or pixels.shape[2] == 3:
-        raise ValueError(f"Invalid pixel array shape: {pixels.shape}")
-
-    # if single channel repeat to 3 channels
-    if pixels.ndim == 3:
-        pixels = np.repeat(pixels[..., None], 3, axis=3)
-
-    # mask everything outside ultrasound region
-    pixels = video_utils.mask_outside_ultrasound(dcm.pixel_array)
-
-    # model specific preprocessing
-    x = np.zeros((len(pixels), 224, 224, 3))
-    for i in range(len(x)):
-        x[i] = video_utils.crop_and_scale(pixels[i])
-
-    x = torch.as_tensor(x, dtype=torch.float).permute([3, 0, 1, 2])
-    # normalize
-    x.sub_(mean).div_(std)
-
-    ## if not enough frames add padding
-    if x.shape[1] < frames_to_take:
-        padding = torch.zeros(
-            (
-                3,
-                frames_to_take - x.shape[1],
-                video_size,
-                video_size,
-            ),
-            dtype=torch.float,
-        )
-        x = torch.cat((x, padding), dim=1)
-
-    start = 0
-    video = x[
-        :, start : (start + frames_to_take) : frame_stride, :, :
-    ]
-    return meta, video
-
-# ─── 5️⃣ BATCH CLASSIFY ─────────────────────────────────────────────────────────
-def classify_batch(videos):
-    # videos: [B, C, T, H, W]
-    first_frames = videos[:, :, 0, :, :].to(device)
-    with torch.no_grad():
-        logits = view_classifier(first_frames)
-    idxs = logits.argmax(dim=1).cpu().tolist()
+@torch.inference_mode()
+@torch.cuda.amp.autocast(dtype=torch.float16)
+def classify_first_frames(videos: torch.Tensor) -> List[str]:
+    """Predict coarse view of batch (uses only first frame)."""
+    logits = model(videos[:, :, 0])  # [B,C,H,W]
+    idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
-# ─── 6️⃣ MAIN PIPELINE ─────────────────────────────────────────────────────────
-def main():
-    print("starting MIMIC-Echo-IV inference pipeline")
-    for root, dirs, files in os.walk(MOUNT_ROOT):
-        dcms = [f for f in files if f.lower().endswith(".dcm")]
-        if not dcms:
+# ─── 3️⃣ DATASET ───────────────────────────────────────────────────────────────
+class EchoDataset(Dataset):
+    def __init__(self, root: Path):
+        self.paths = sorted(root.rglob("*.dcm"))
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, Any], str]:
+        path = self.paths[idx]
+        dcm  = pydicom.dcmread(path, force=True)
+
+        meta = {el.name: el.repval for el in dcm}
+        px   = dcm.pixel_array  # pylibjpeg handles compressed syntaxes
+
+        if px.ndim < 3 or px.shape[2] == 3:
+            raise ValueError(f"Invalid pixel array shape: {px.shape}")
+
+        # (H,W,T)  →  (T,H,W,1) → repeat channels
+        if px.ndim == 3:
+            px = np.repeat(px[..., None], 3, axis=-1)
+
+        px = video_utils.mask_outside_ultrasound(px)
+
+        # Vectorised crop/scale (batch‑wise)
+        if hasattr(video_utils, "crop_and_scale_batch"):
+            vid = video_utils.crop_and_scale_batch(px, out_h=SIZE, out_w=SIZE)
+        else:  # fallback
+            vid = np.stack([video_utils.crop_and_scale(f) for f in px])
+
+        vid = torch.from_numpy(vid).permute(3, 0, 1, 2).float()  # [C,T,H,W]
+
+        # Pad / stride
+        if vid.shape[1] < FRAMES_TAKE:
+            pad = torch.zeros(3, FRAMES_TAKE - vid.shape[1], SIZE, SIZE)
+            vid = torch.cat([vid, pad], 1)
+        else:
+            vid = vid[:, ::FRAME_STRIDE, :, :][:, :FRAMES_TAKE]
+
+        vid.sub_(MEAN).div_(STD)          # normalise in‑place
+        return vid, meta, str(path.relative_to(MOUNT_ROOT))
+
+
+def collate(batch):
+    vids, metas, keys = zip(*batch)
+    vids = torch.stack(vids, 0)  # [B,C,T,H,W]
+    return vids, metas, keys
+
+# ─── 4️⃣ MAIN ─────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    print("⚙️  Building dataset from", MOUNT_ROOT)
+    ds = EchoDataset(MOUNT_ROOT)
+    dl = DataLoader(ds,
+                    batch_size=BATCH_SIZE,
+                    shuffle=False,
+                    num_workers=NUM_WORKERS,
+                    pin_memory=True,
+                    persistent_workers=True,
+                    collate_fn=collate)
+
+    results: Dict[str, Any] = {}
+    failed: List[str] = []
+
+    for vids, metas, keys in tqdm(dl, desc="🔍 inferring", unit="batch"):
+        try:
+            vids = vids.half().to(DEVICE, non_blocking=True)
+            views = classify_first_frames(vids)
+        except Exception as e:
+            failed.extend(keys)
+            traceback.print_exc()
             continue
 
-        rel        = os.path.relpath(root, MOUNT_ROOT)
-        out_folder = os.path.join(OUTPUT_ROOT, rel)
-        os.makedirs(out_folder, exist_ok=True)
+        for k, m, v in zip(keys, metas, views):
+            results[k] = {"metadata": m, "predicted_view": v}
 
-        out_file = os.path.join(out_folder, "results.json")
-        failed_file = os.path.join(out_folder, "failed.txt")
+        # periodic flush to disk
+        if len(results) % FLUSH_EVERY == 0:
+            _flush(results, failed)
 
-        if os.path.exists(out_file):
-            with open(out_file) as f:
-                print(f"✔️  {rel} already done—found {out_file}. Skipping.")
-                continue
+    _flush(results, failed)  # final write
+    print("✅  Done. successes=", len(results), "failures=", len(failed))
 
 
-        failed = []
-        results = {}
-        print(f"\n▶️  Processing {rel}: {len(dcms)} files remaining")
-
-        metas, vids, names = [], [], []
-        for i, name in enumerate(dcms):
-            dcm_path = os.path.join(root, name)
-            try:
-                meta, vid = process_single_dicom(dcm_path)
-                metas.append(meta)
-                vids.append(vid)
-                names.append(name)
-            except Exception as e:
-                # results[dcm_path] = {"error": str(e), "trace": traceback.format_exc()}
-                failed.append(os.path.relpath(dcm_path, MOUNT_ROOT))
-            
-            # Every BATCH_SIZE files, classify + flush
-            if len(vids) >= BATCH_SIZE or ((i == len(dcms) - 1) and len(vids) > 0):
-                vids_stack = torch.stack(vids)
-                views = classify_batch(vids_stack)
-                for nm, md, vw in zip(names, metas, views):
-                    file_path = os.path.join(root, nm)
-                    result_key = os.path.relpath(file_path, MOUNT_ROOT)
-                    results[result_key] = {"metadata": md, "predicted_view": vw}
-
-                # Save results
-                with open(out_file, "w") as f:
-                    json.dump(results, f, indent=2)
-                with open(failed_file, "w") as f:
-                    for fn in failed:
-                        f.write(fn + "\n")
-
-                # Clear buffers for next batch
-                metas.clear()
-                vids.clear()
-                names.clear()
-
-        print(f"✅  {rel}: done. successes={len(results)}, failures={len(failed)}")
-
-    print("\n🎉 All folders processed; outputs under", OUTPUT_ROOT)
+def _flush(results: Dict[str, Any], failed: List[str]):
+    out_file    = OUTPUT_ROOT / "results.json"
+    failed_file = OUTPUT_ROOT / "failed.txt"
+    with out_file.open("w") as f:
+        json.dump(results, f, indent=2)
+    with failed_file.open("w") as f:
+        f.write("\n".join(failed))
 
 
 if __name__ == "__main__":
+    torch.backends.cudnn.benchmark = True      # autotune convolution kernels
     main()

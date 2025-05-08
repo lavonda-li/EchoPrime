@@ -4,3 +4,4 @@ model_data/
 saved_embeddings/*
 venv
 __MACOSX/*
+*.DS_Store
