@@ -21,7 +21,7 @@ OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 1
+BATCH_SIZE   = 64
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 FLUSH_EVERY  = 512
 PREFETCH     = 8
@@ -113,6 +113,7 @@ def main():
     results: Dict[str, Any] = {}
     failed: List[str] = []
 
+    print(f"🔍  Starting inference on {len(ds):,} files in {len(dl):,} batches of size {BATCH_SIZE:,}")
     for batch_idx, (vids, metas, keys) in enumerate(tqdm(dl, desc="🔍 inferring", unit="batch")):
         try:
             vids = vids.half().to(DEVICE, non_blocking=True)
