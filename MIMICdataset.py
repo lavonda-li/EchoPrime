@@ -21,7 +21,7 @@ OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 64
+BATCH_SIZE   = 1
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 FLUSH_EVERY  = 512
 PREFETCH     = 8
