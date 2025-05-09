@@ -28,7 +28,7 @@ import video_utils
 
 # ─── 1️⃣ CONFIG ────────────────────────────────────────────────────────────────
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
-OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
+OUTPUT_ROOT = Path(os.path.expanduser("~/mount-folder/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 HAS_CUDA     = torch.cuda.is_available()
