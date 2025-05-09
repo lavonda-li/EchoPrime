@@ -34,7 +34,7 @@ import video_utils
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DONE_DIRS_FILE = OUTPUT_ROOT / "done_dirs.txt"
+DONE_DIRS_FILE = Path("done_dirs.txt")
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
