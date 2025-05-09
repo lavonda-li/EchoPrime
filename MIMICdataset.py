@@ -29,8 +29,8 @@ import utils, video_utils
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DONE_DIRS_FILE     = OUTPUT_ROOT / "done_dirs.txt"
-PROCESSED_DCM_FILE = OUTPUT_ROOT / "processed_dcms.txt"
+DONE_DIRS_FILE     = Path("done_dirs.txt")
+PROCESSED_DCM_FILE = Path("processed_dcms.txt")
 
 # GPU & batching tuned for 1× T4 (16 GB)
 DEVICE       = torch.device("cuda")
