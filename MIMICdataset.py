@@ -34,7 +34,7 @@ PROCESSED_DCM_FILE  = Path("processed_dcms.txt")
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
-BATCH_SIZE   = 64
+BATCH_SIZE   = 8
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 PREFETCH     = 16
 
@@ -168,10 +168,12 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
     # processed_dirs   = set(results_per_dir.keys()) | set(failed_per_dir.keys())
 
     # 1. successes
+    success = 0
     for rel_dir, res in list(results_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / "results.json"
+        success += len(res)
         if out_file.exists():
             with out_file.open() as f:
                 existing = json.load(f)
@@ -183,22 +185,23 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
             json.dump(data, f, indent=2)
         processed_files.extend(res.keys())
         results_per_dir.pop(rel_dir, None)
+    print(f"\n🔔 {success:,} successes in this batch.")
 
     # 2. failures
+    failures = 0
     for rel_dir, fails in list(failed_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         failed_file = out_dir / "failed.txt"
+        failures += len(fails)
         with failed_file.open("a") as f:
             for fn in fails:
                 f.write(fn + "\n")
         processed_files.extend(fails)
         failed_per_dir.pop(rel_dir, None)
+    print(f"🔔 {failures:,} failures in this batch.")
 
     # 3. record processed files
-    successes = sum(len(res) for res in results_per_dir.values())
-    failures = sum(len(fails) for fails in failed_per_dir.values())
-    print(f"🔔 {successes:,} successes, {failures:,} failures in this batch.")
     if processed_files:
         with PROCESSED_DCM_FILE.open("a") as pf:
             for pth in processed_files:
