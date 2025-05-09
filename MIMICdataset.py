@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
-"""MIMIC‑Echo‑IV view‑classification ─ per‑folder outputs (immediate flush)
+"""MIMIC‑Echo‑IV view‑classification  ─ per‑folder outputs (immediate flush)
 ----------------------------------------------------------------------------
-* Results and failed logs are written **immediately after every batch**
-  to mirror the input directory hierarchy, eliminating any risk of data
-  loss if the job is interrupted.
-* IterableDataset streams lazily; clips are padded/trimmed to 32 frames.
+* Resumes safely at both **folder** and **file** granularity.
+  - `done_dirs.txt` records completed directories.
+  - `processed_dcms.txt` records each *.dcm* file once attempted (success or fail).
+* IterableDataset streams lazily; clips are padded/trimmed to 32 frames.
 * Works with CUDA.
-
-This version keeps a persistent `done_dirs.txt` file. A directory is added
-only **after** the number of successes plus failures reaches the total count
-of *.dcm* files inside that directory.
 """
 
 import json
 import os
-import traceback
-from contextlib import nullcontext
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Any, Iterable, Tuple, List
+from typing import Dict, Any, List
 
 import numpy as np
 import pydicom
@@ -34,7 +28,9 @@ import video_utils
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DONE_DIRS_FILE = Path("done_dirs.txt")
+
+DONE_DIRS_FILE      = Path("done_dirs.txt")
+PROCESSED_DCM_FILE  = Path("processed_dcms.txt")
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
@@ -48,13 +44,12 @@ SIZE         = 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3, 1, 1, 1)
 STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3, 1, 1, 1)
 
-# ─── 2️⃣ MODEL ────────────────────────────────────────────────────────────────
+# ─── 2️⃣ LOAD MODEL ───────────────────────────────────────────────────────────
 ckpt = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
 state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
 model = torchvision.models.convnext_base()
 model.classifier[-1] = torch.nn.Linear(model.classifier[-1].in_features, len(utils.COARSE_VIEWS))
 model.load_state_dict(state, strict=False)
-
 model = model.to(DEVICE).half().eval()
 if torch.__version__ >= "2":
     model = torch.compile(model)
@@ -67,13 +62,17 @@ def classify_first_frames(videos: torch.Tensor) -> List[str]:
     idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
-# ─── 3️⃣ LOAD DONE_DIRS ───────────────────────────────────────────────────────
-print("🔔 Loading completed folders list …")
+# ─── 3️⃣ LOAD RESUME STATE ─────────────────────────────────────────────────────
+print("🔔 Loading resume state …")
 DONE_DIRS: set[str] = set()
 if DONE_DIRS_FILE.exists():
     with DONE_DIRS_FILE.open() as f:
         DONE_DIRS.update(line.strip() for line in f if line.strip())
-print(f"🔔 {len(DONE_DIRS):,} directories already completed.")
+PROCESSED_DCMS: set[str] = set()
+if PROCESSED_DCM_FILE.exists():
+    with PROCESSED_DCM_FILE.open() as f:
+        PROCESSED_DCMS.update(line.strip() for line in f if line.strip())
+print(f"🔔 {len(DONE_DIRS):,} completed dirs; {len(PROCESSED_DCMS):,} processed DICOMs loaded.")
 
 # ─── 4️⃣ ITERABLE DATASET ─────────────────────────────────────────────────────
 class EchoIterableDataset(IterableDataset):
@@ -87,6 +86,9 @@ class EchoIterableDataset(IterableDataset):
             if rel_pat in DONE_DIRS:
                 continue
             for path in pat.rglob("*.dcm"):
+                rel_path = path.relative_to(MOUNT_ROOT).as_posix()
+                if rel_path in PROCESSED_DCMS:
+                    continue  # already seen
                 try:
                     yield self._proc(path)
                 except Exception:
@@ -98,7 +100,7 @@ class EchoIterableDataset(IterableDataset):
         meta = {el.name: el.repval for el in dcm}
         px   = dcm.pixel_array
         if px.ndim < 3 or (px.ndim == 3 and px.shape[-1] == 3):
-            raise ValueError(f"Invalid pixel array shape: {px.shape}")
+            raise ValueError("Invalid pixel array shape: %s" % (px.shape,))
         if px.ndim == 3:
             px = np.repeat(px[..., None], 3, axis=-1)
         px = video_utils.mask_outside_ultrasound(px)
@@ -115,7 +117,7 @@ class EchoIterableDataset(IterableDataset):
             vid = vid[:, :FRAMES_TAKE]
         vid.sub_(MEAN).div_(STD)
         rel_path = path.relative_to(MOUNT_ROOT).as_posix()
-        rel_dir  = Path(rel_path).parent.as_posix()
+        rel_dir  = path.parent.relative_to(MOUNT_ROOT).as_posix()
         return vid, meta, rel_path, rel_dir
 
 # ─── 5️⃣ MAIN LOOP ────────────────────────────────────────────────────────────
@@ -124,7 +126,6 @@ def _one_thread(_):
     torch.set_num_threads(1)
 
 def main():
-    print("🔔 Setting up DataLoader …")
     ds = EchoIterableDataset()
     dl = DataLoader(ds,
                     batch_size=BATCH_SIZE,
@@ -137,10 +138,9 @@ def main():
 
     results_per_dir: Dict[str, Dict[str, Any]] = defaultdict(dict)
     failed_per_dir:  Dict[str, List[str]]      = defaultdict(list)
-    total_done = 0
 
     for bidx, batch in enumerate(tqdm(dl, desc="🔍 inferring", unit="batch")):
-        vids, metas, keys, dirs = batch
+        vids, metas, keys, dirs = batch  # keys is rel_path per file
         vids = torch.stack(list(vids))
         try:
             vids = vids.to(DEVICE, dtype=torch.float16, non_blocking=HAS_CUDA)
@@ -153,23 +153,21 @@ def main():
 
         for k, m, v, d in zip(keys, metas, views, dirs):
             results_per_dir[d][k] = {"metadata": m, "predicted_view": v}
-            total_done += 1
 
         _flush(results_per_dir, failed_per_dir)
-        print(f"✔️  Batch {bidx+1} complete • total processed {total_done}")
 
-    print("✅  Full run complete. Total successes:", total_done)
+    print("✅  Run complete.")
 
-# ─── 6️⃣ FLUSH LOGIC ──────────────────────────────────────────────────────────
+# ─── 6️⃣ FLUSH ────────────────────────────────────────────────────────────────
 
 def _flush(results_per_dir: Dict[str, Dict[str, Any]],
            failed_per_dir: Dict[str, List[str]]):
-    """Write results/failures and, if finished, mark directory complete.
-       Also print per-folder stats (success, failure, total)."""
+    """Flush batch results, failures, and update progress trackers."""
 
-    processed_dirs = set(results_per_dir.keys()) | set(failed_per_dir.keys())
+    processed_files: List[str] = []
+    processed_dirs   = set(results_per_dir.keys()) | set(failed_per_dir.keys())
 
-    # 1. write successes
+    # 1. successes
     for rel_dir, res in list(results_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -183,9 +181,10 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
             data = res
         with out_file.open("w") as f:
             json.dump(data, f, indent=2)
+        processed_files.extend(res.keys())
         results_per_dir.pop(rel_dir, None)
 
-    # 2. write failures
+    # 2. failures
     for rel_dir, fails in list(failed_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -193,39 +192,41 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
         with failed_file.open("a") as f:
             for fn in fails:
                 f.write(fn + "\n")
+        processed_files.extend(fails)
         failed_per_dir.pop(rel_dir, None)
 
-    # 3. per-dir stats + completion check
-    for rel_dir in processed_dirs:
-        out_dir = OUTPUT_ROOT / rel_dir
-        out_file   = out_dir / "results.json"
-        failed_file = out_dir / "failed.txt"
+    # 3. record processed files
+    if processed_files:
+        with PROCESSED_DCM_FILE.open("a") as pf:
+            for pth in processed_files:
+                if pth not in PROCESSED_DCMS:
+                    pf.write(pth + "\n")
+                    PROCESSED_DCMS.add(pth)
 
+    # 4. directory completion check
+    for rel_dir in processed_dirs:
+        if rel_dir in DONE_DIRS:
+            continue
+        out_dir = OUTPUT_ROOT / rel_dir
+        total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
         successes = 0
-        if out_file.exists():
-            with out_file.open() as f:
+        res_file = out_dir / "results.json"
+        if res_file.exists():
+            with res_file.open() as f:
                 successes = len(json.load(f))
         failures = 0
-        if failed_file.exists():
-            with failed_file.open() as f:
+        fail_file = out_dir / "failed.txt"
+        if fail_file.exists():
+            with fail_file.open() as f:
                 failures = sum(1 for _ in f)
 
-        total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
-
-        print(f"{rel_dir}: successes={successes}, failures={failures}, total={total_dcm}")
-
-        if rel_dir in DONE_DIRS:
-            continue  # already recorded earlier
+        print(f"{rel_dir}: success={successes}, fail={failures}, total={total_dcm}")
 
         if successes + failures >= total_dcm > 0:
-            with DONE_DIRS_FILE.open("a") as f:
-                f.write(rel_dir + "\n")
+            with DONE_DIRS_FILE.open("a") as df:
+                df.write(rel_dir + "\n")
             DONE_DIRS.add(rel_dir)
-            print(f"🏁  {rel_dir} marked complete and added to DONE_DIRS.")
-            with DONE_DIRS_FILE.open("a") as f:
-                f.write(rel_dir + "\n")
-            DONE_DIRS.add(rel_dir)
-            print(f"🏁  {rel_dir} marked complete")
+            print(f"🏁  {rel_dir} marked complete.")
 
 if __name__ == "__main__":
     assert HAS_CUDA, "CUDA is required for this script."
