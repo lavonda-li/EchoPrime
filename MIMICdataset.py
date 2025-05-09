@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""MIMIC‐Echo‐IV view‐classification  ─ per‐folder outputs (immediate flush)
+"""MIMIC‑Echo‑IV view‑classification ─ per‑folder outputs (immediate flush)
 ----------------------------------------------------------------------------
 * Results and failed logs are written **immediately after every batch**
   to mirror the input directory hierarchy, eliminating any risk of data
   loss if the job is interrupted.
 * IterableDataset streams lazily; clips are padded/trimmed to 32 frames.
-* Works with or without CUDA.
+* Works with CUDA.
+
+This version keeps a persistent `done_dirs.txt` file. A directory is added
+only **after** the number of successes plus failures reaches the total count
+of *.dcm* files inside that directory.
 """
 
 import json
@@ -26,11 +30,11 @@ from tqdm import tqdm
 import utils
 import video_utils
 
-# ─── 1️⃣ CONFIG ─────────────────────────────────────────
+# ─── 1️⃣ CONFIG ────────────────────────────────────────────────────────────────
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DONE_DIRS_FILE = Path("done_dirs.txt")
+DONE_DIRS_FILE = OUTPUT_ROOT / "done_dirs.txt"
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
@@ -44,7 +48,7 @@ SIZE         = 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3, 1, 1, 1)
 STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3, 1, 1, 1)
 
-# ─── 2️⃣ MODEL ──────────────────────────────────────
+# ─── 2️⃣ MODEL ────────────────────────────────────────────────────────────────
 ckpt = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
 state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
 model = torchvision.models.convnext_base()
@@ -63,20 +67,15 @@ def classify_first_frames(videos: torch.Tensor) -> List[str]:
     idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
-# ─── 3️⃣ DISCOVER COMPLETED FOLDERS ──────────────────────────────
-print("🔔 Loading completed folders from output...")
-DONE_DIRS = set()
+# ─── 3️⃣ LOAD DONE_DIRS ───────────────────────────────────────────────────────
+print("🔔 Loading completed folders list …")
+DONE_DIRS: set[str] = set()
 if DONE_DIRS_FILE.exists():
     with DONE_DIRS_FILE.open() as f:
         DONE_DIRS.update(line.strip() for line in f if line.strip())
+print(f"🔔 {len(DONE_DIRS):,} directories already completed.")
 
-if DONE_DIRS:
-    for d in sorted(DONE_DIRS):
-        print(f"✔️  {d} already done — skipping.")
-    print(f"⚠️  Detected {len(DONE_DIRS):,} completed folders; they will be skipped.")
-
-
-# ─── 4️⃣ ITERABLE DATASET ──────────────────────────────
+# ─── 4️⃣ ITERABLE DATASET ─────────────────────────────────────────────────────
 class EchoIterableDataset(IterableDataset):
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -91,7 +90,6 @@ class EchoIterableDataset(IterableDataset):
                 try:
                     yield self._proc(path)
                 except Exception:
-                    # traceback.print_exc()
                     continue
 
     @staticmethod
@@ -120,13 +118,13 @@ class EchoIterableDataset(IterableDataset):
         rel_dir  = Path(rel_path).parent.as_posix()
         return vid, meta, rel_path, rel_dir
 
-# ─── 5️⃣ MAIN ─────────────────────────────────────
+# ─── 5️⃣ MAIN LOOP ────────────────────────────────────────────────────────────
 
 def _one_thread(_):
     torch.set_num_threads(1)
 
 def main():
-    print("🔔 Setting up DataLoader...")
+    print("🔔 Setting up DataLoader …")
     ds = EchoIterableDataset()
     dl = DataLoader(ds,
                     batch_size=BATCH_SIZE,
@@ -137,7 +135,6 @@ def main():
                     collate_fn=lambda x: tuple(zip(*x)),
                     worker_init_fn=_one_thread if HAS_CUDA else None)
 
-    print(f"🔔 Starting inference loop on {DEVICE} with batch size {BATCH_SIZE}...")
     results_per_dir: Dict[str, Dict[str, Any]] = defaultdict(dict)
     failed_per_dir:  Dict[str, List[str]]      = defaultdict(list)
     total_done = 0
@@ -146,13 +143,11 @@ def main():
         vids, metas, keys, dirs = batch
         vids = torch.stack(list(vids))
         try:
-            vids = vids.to(DEVICE, dtype=torch.float16 if HAS_CUDA else torch.float32, non_blocking=HAS_CUDA)
+            vids = vids.to(DEVICE, dtype=torch.float16, non_blocking=HAS_CUDA)
             views = classify_first_frames(vids)
         except Exception:
-            print(f"❌ Exception in batch {bidx+1} — flushing partial results.")
             for k, d in zip(keys, dirs):
                 failed_per_dir[d].append(k)
-            # traceback.print_exc()
             _flush(results_per_dir, failed_per_dir)
             continue
 
@@ -161,12 +156,19 @@ def main():
             total_done += 1
 
         _flush(results_per_dir, failed_per_dir)
-        print(f"✔️  Finished batch {bidx+1}: {len(keys)} files, total done {total_done}")
+        print(f"✔️  Batch {bidx+1} complete • total processed {total_done}")
 
-    print("✅  Complete run. Total successful samples:", total_done)
+    print("✅  Full run complete. Total successes:", total_done)
+
+# ─── 6️⃣ FLUSH LOGIC ──────────────────────────────────────────────────────────
 
 def _flush(results_per_dir: Dict[str, Dict[str, Any]],
            failed_per_dir: Dict[str, List[str]]):
+    """Write results/failures and mark directory done when finished."""
+
+    processed_dirs = set(results_per_dir.keys()) | set(failed_per_dir.keys())
+
+    # 1. write successes
     for rel_dir, res in list(results_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -180,12 +182,9 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
             data = res
         with out_file.open("w") as f:
             json.dump(data, f, indent=2)
-        # with DONE_DIRS_FILE.open("a") as done_file:
-            # if rel_dir not in DONE_DIRS:
-            #     DONE_DIRS.add(rel_dir)
-            #     done_file.write(rel_dir + "\n")
         results_per_dir.pop(rel_dir, None)
 
+    # 2. write failures
     for rel_dir, fails in list(failed_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -195,7 +194,29 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
                 f.write(fn + "\n")
         failed_per_dir.pop(rel_dir, None)
 
-if __name__ == "__main__":
-    assert HAS_CUDA, "CUDA is required for this script."
-    torch.backends.cudnn.benchmark = True
-    main()
+    # 3. check completion for each processed dir
+    for rel_dir in processed_dirs:
+        if rel_dir in DONE_DIRS:
+            continue  # already recorded
+
+        out_dir = OUTPUT_ROOT / rel_dir
+        out_file = out_dir / "results.json"
+        failed_file = out_dir / "failed.txt"
+
+        # count successes & failures
+        successes = 0
+        if out_file.exists():
+            with out_file.open() as f:
+                successes = len(json.load(f))
+        failures = 0
+        if failed_file.exists():
+            with failed_file.open() as f:
+                failures = sum(1 for _ in f)
+
+        total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
+
+        if successes + failures >= total_dcm > 0:
+            with DONE_DIRS_FILE.open("a") as f:
+                f.write(rel_dir + "\n")
+            DONE_DIRS.add(rel_dir)
+            print(f"🏁  {rel_dir} marked complete")
