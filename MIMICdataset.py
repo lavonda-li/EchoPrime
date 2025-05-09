@@ -93,7 +93,7 @@ class EchoIterableDataset(IterableDataset):
                 try:
                     yield self._proc(path)
                 except Exception:
-                    traceback.print_exc()
+                    # traceback.print_exc()
                     continue
 
     @staticmethod
@@ -154,7 +154,7 @@ def main():
             print(f"❌ Exception in batch {bidx+1} — flushing partial results.")
             for k, d in zip(keys, dirs):
                 failed_per_dir[d].append(k)
-            traceback.print_exc()
+            # traceback.print_exc()
             _flush(results_per_dir, failed_per_dir)
             continue
 
