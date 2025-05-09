@@ -70,8 +70,8 @@ if DONE_DIRS_FILE.exists():
     with DONE_DIRS_FILE.open() as f:
         DONE_DIRS.update(line.strip() for line in f if line.strip())
 
-json_dirs = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
-DONE_DIRS.update(json_dirs)
+# json_dirs = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
+# DONE_DIRS.update(json_dirs)
 
 if DONE_DIRS:
     for d in sorted(DONE_DIRS):
