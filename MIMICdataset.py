@@ -78,6 +78,12 @@ if DONE_DIRS:
         print(f"✔️  {d} already done — skipping.")
     print(f"⚠️  Detected {len(DONE_DIRS):,} completed folders; they will be skipped.")
 
+    # write the list of completed folders to a file or append to an existing one
+    with DONE_DIRS_FILE.open("a") as done_file:
+        for d in DONE_DIRS:
+            done_file.write(d + "\n")
+
+
 # ─── 4️⃣ ITERABLE DATASET ──────────────────────────────
 class EchoIterableDataset(IterableDataset):
     def __iter__(self):
