@@ -34,7 +34,7 @@ PROCESSED_DCM_FILE  = Path("processed_dcms.txt")
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
-BATCH_SIZE   = 1
+BATCH_SIZE   = 64
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 PREFETCH     = 16
 
