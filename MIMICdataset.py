@@ -226,3 +226,8 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
                 f.write(rel_dir + "\n")
             DONE_DIRS.add(rel_dir)
             print(f"🏁  {rel_dir} marked complete")
+
+if __name__ == "__main__":
+    assert HAS_CUDA, "CUDA is required for this script."
+    torch.backends.cudnn.benchmark = True
+    main()
