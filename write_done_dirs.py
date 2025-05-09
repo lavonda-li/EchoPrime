@@ -6,7 +6,7 @@ from pathlib import Path
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-DONE_DIRS_FILE = "done_dirs.txt"
+DONE_DIRS_FILE = Path("done_dirs.txt")
 
 
 BATCH_SIZE   = 64
