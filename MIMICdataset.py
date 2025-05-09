@@ -34,7 +34,7 @@ DONE_DIRS_FILE = Path("done_dirs.txt")
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
-BATCH_SIZE   = 64
+BATCH_SIZE   = 1
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 PREFETCH     = 16
 
@@ -69,9 +69,6 @@ DONE_DIRS = set()
 if DONE_DIRS_FILE.exists():
     with DONE_DIRS_FILE.open() as f:
         DONE_DIRS.update(line.strip() for line in f if line.strip())
-
-# json_dirs = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
-# DONE_DIRS.update(json_dirs)
 
 if DONE_DIRS:
     for d in sorted(DONE_DIRS):
