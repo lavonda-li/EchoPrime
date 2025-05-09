@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MIMIC‑Echo‑IV view‑classification  ─ per‑folder outputs (immediate flush)
+"""MIMIC‐Echo‐IV view‐classification  ─ per‐folder outputs (immediate flush)
 ----------------------------------------------------------------------------
 * Results and failed logs are written **immediately after every batch**
   to mirror the input directory hierarchy, eliminating any risk of data
@@ -26,10 +26,11 @@ from tqdm import tqdm
 import utils
 import video_utils
 
-# ─── 1️⃣ CONFIG ────────────────────────────────────────────────────────────────
+# ─── 1️⃣ CONFIG ─────────────────────────────────────────
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
-OUTPUT_ROOT = Path(os.path.expanduser("~/mount-folder/inference_output"))
+OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+DONE_DIRS_FILE = OUTPUT_ROOT / "done_dirs.txt"
 
 HAS_CUDA     = torch.cuda.is_available()
 DEVICE       = torch.device("cuda")
@@ -43,7 +44,7 @@ SIZE         = 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3, 1, 1, 1)
 STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3, 1, 1, 1)
 
-# ─── 2️⃣ MODEL ────────────────────────────────────────────────────────────────
+# ─── 2️⃣ MODEL ──────────────────────────────────────
 ckpt = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
 state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
 model = torchvision.models.convnext_base()
@@ -62,17 +63,23 @@ def classify_first_frames(videos: torch.Tensor) -> List[str]:
     idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
-# ─── 3️⃣ DISCOVER COMPLETED FOLDERS ────────────────────────────────────────────
-print("🔔 Discovering completed folders...")
-DONE_DIRS = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
+# ─── 3️⃣ DISCOVER COMPLETED FOLDERS ──────────────────────────────
+print("🔔 Loading completed folders from output...")
+DONE_DIRS = set()
+if DONE_DIRS_FILE.exists():
+    with DONE_DIRS_FILE.open() as f:
+        DONE_DIRS.update(line.strip() for line in f if line.strip())
+
+json_dirs = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
+DONE_DIRS.update(json_dirs)
+
 if DONE_DIRS:
     for d in sorted(DONE_DIRS):
         print(f"✔️  {d} already done — skipping.")
     print(f"⚠️  Detected {len(DONE_DIRS):,} completed folders; they will be skipped.")
 
-# ─── 4️⃣ ITERABLE DATASET ──────────────────────────────────────────────────────
+# ─── 4️⃣ ITERABLE DATASET ──────────────────────────────
 class EchoIterableDataset(IterableDataset):
-    """Streams DICOM files lazily; clips are fixed‑length."""
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         patients = sorted([p for p in MOUNT_ROOT.iterdir() if p.is_dir()])
@@ -115,7 +122,7 @@ class EchoIterableDataset(IterableDataset):
         rel_dir  = Path(rel_path).parent.as_posix()
         return vid, meta, rel_path, rel_dir
 
-# ─── 5️⃣ MAIN ─────────────────────────────────────────────────────────────────
+# ─── 5️⃣ MAIN ─────────────────────────────────────
 
 def _one_thread(_):
     torch.set_num_threads(1)
@@ -160,7 +167,6 @@ def main():
 
     print("✅  Complete run. Total successful samples:", total_done)
 
-
 def _flush(results_per_dir: Dict[str, Dict[str, Any]],
            failed_per_dir: Dict[str, List[str]]):
     for rel_dir, res in list(results_per_dir.items()):
@@ -176,7 +182,10 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
             data = res
         with out_file.open("w") as f:
             json.dump(data, f, indent=2)
+        with DONE_DIRS_FILE.open("a") as done_file:
+            done_file.write(rel_dir + "\n")
         results_per_dir.pop(rel_dir, None)
+
     for rel_dir, fails in list(failed_per_dir.items()):
         out_dir = OUTPUT_ROOT / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -185,7 +194,6 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
             for fn in fails:
                 f.write(fn + "\n")
         failed_per_dir.pop(rel_dir, None)
-
 
 if __name__ == "__main__":
     assert HAS_CUDA, "CUDA is required for this script."
