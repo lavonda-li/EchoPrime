@@ -32,8 +32,8 @@ OUTPUT_ROOT = Path(os.path.expanduser("~/mount-folder/inference_output"))
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 HAS_CUDA     = torch.cuda.is_available()
-DEVICE       = torch.device("cuda" if HAS_CUDA else "cpu")
-BATCH_SIZE   = 64 if HAS_CUDA else 8
+DEVICE       = torch.device("cuda")
+BATCH_SIZE   = 64
 NUM_WORKERS  = min(24, os.cpu_count() or 1)
 PREFETCH     = 16
 
@@ -50,23 +50,20 @@ model = torchvision.models.convnext_base()
 model.classifier[-1] = torch.nn.Linear(model.classifier[-1].in_features, len(utils.COARSE_VIEWS))
 model.load_state_dict(state, strict=False)
 
-if HAS_CUDA:
-    model = model.to(DEVICE).half().eval()
-    if torch.__version__ >= "2":
-        model = torch.compile(model)
-    _autocast = torch.cuda.amp.autocast
-else:
-    model = model.to(DEVICE).float().eval()
-    _autocast = nullcontext
+model = model.to(DEVICE).half().eval()
+if torch.__version__ >= "2":
+    model = torch.compile(model)
+_autocast = torch.cuda.amp.autocast
 
 @torch.inference_mode()
 def classify_first_frames(videos: torch.Tensor) -> List[str]:
-    with _autocast(enabled=HAS_CUDA, dtype=torch.float16 if HAS_CUDA else torch.float32):
+    with _autocast(enabled=True, dtype=torch.float16):
         logits = model(videos[:, :, 0])
     idxs = logits.argmax(1).cpu().tolist()
     return [utils.COARSE_VIEWS[i] for i in idxs]
 
 # ─── 3️⃣ DISCOVER COMPLETED FOLDERS ────────────────────────────────────────────
+print("🔔 Discovering completed folders...")
 DONE_DIRS = {p.parent.relative_to(OUTPUT_ROOT).as_posix() for p in OUTPUT_ROOT.rglob("results.json")}
 if DONE_DIRS:
     for d in sorted(DONE_DIRS):
@@ -124,6 +121,7 @@ def _one_thread(_):
     torch.set_num_threads(1)
 
 def main():
+    print("🔔 Setting up DataLoader...")
     ds = EchoIterableDataset()
     dl = DataLoader(ds,
                     batch_size=BATCH_SIZE,
@@ -134,6 +132,7 @@ def main():
                     collate_fn=lambda x: tuple(zip(*x)),
                     worker_init_fn=_one_thread if HAS_CUDA else None)
 
+    print(f"🔔 Starting inference loop on {DEVICE} with batch size {BATCH_SIZE}...")
     results_per_dir: Dict[str, Dict[str, Any]] = defaultdict(dict)
     failed_per_dir:  Dict[str, List[str]]      = defaultdict(list)
     total_done = 0
@@ -145,10 +144,10 @@ def main():
             vids = vids.to(DEVICE, dtype=torch.float16 if HAS_CUDA else torch.float32, non_blocking=HAS_CUDA)
             views = classify_first_frames(vids)
         except Exception:
+            print(f"❌ Exception in batch {bidx+1} — flushing partial results.")
             for k, d in zip(keys, dirs):
                 failed_per_dir[d].append(k)
             traceback.print_exc()
-            # Even on failure, flush what we have for that batch.
             _flush(results_per_dir, failed_per_dir)
             continue
 
@@ -156,11 +155,10 @@ def main():
             results_per_dir[d][k] = {"metadata": m, "predicted_view": v}
             total_done += 1
 
-        # Flush immediately to disk to avoid data loss.
         _flush(results_per_dir, failed_per_dir)
         print(f"✔️  Finished batch {bidx+1}: {len(keys)} files, total done {total_done}")
 
-    print("✅  Complete run. successes=", total_done)
+    print("✅  Complete run. Total successful samples:", total_done)
 
 
 def _flush(results_per_dir: Dict[str, Dict[str, Any]],
@@ -190,6 +188,6 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
 
 
 if __name__ == "__main__":
-    if HAS_CUDA:
-        torch.backends.cudnn.benchmark = True
+    assert HAS_CUDA, "CUDA is required for this script."
+    torch.backends.cudnn.benchmark = True
     main()
