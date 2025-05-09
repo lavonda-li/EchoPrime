@@ -164,7 +164,8 @@ def main():
 
 def _flush(results_per_dir: Dict[str, Dict[str, Any]],
            failed_per_dir: Dict[str, List[str]]):
-    """Write results/failures and mark directory done when finished."""
+    """Write results/failures and, if finished, mark directory complete.
+       Also print per-folder stats (success, failure, total)."""
 
     processed_dirs = set(results_per_dir.keys()) | set(failed_per_dir.keys())
 
@@ -194,16 +195,12 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
                 f.write(fn + "\n")
         failed_per_dir.pop(rel_dir, None)
 
-    # 3. check completion for each processed dir
+    # 3. per-dir stats + completion check
     for rel_dir in processed_dirs:
-        if rel_dir in DONE_DIRS:
-            continue  # already recorded
-
         out_dir = OUTPUT_ROOT / rel_dir
-        out_file = out_dir / "results.json"
+        out_file   = out_dir / "results.json"
         failed_file = out_dir / "failed.txt"
 
-        # count successes & failures
         successes = 0
         if out_file.exists():
             with out_file.open() as f:
@@ -215,7 +212,16 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
 
         total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
 
+        print(f"{rel_dir}: successes={successes}, failures={failures}, total={total_dcm}")
+
+        if rel_dir in DONE_DIRS:
+            continue  # already recorded earlier
+
         if successes + failures >= total_dcm > 0:
+            with DONE_DIRS_FILE.open("a") as f:
+                f.write(rel_dir + "\n")
+            DONE_DIRS.add(rel_dir)
+            print(f"🏁  {rel_dir} marked complete and added to DONE_DIRS.")
             with DONE_DIRS_FILE.open("a") as f:
                 f.write(rel_dir + "\n")
             DONE_DIRS.add(rel_dir)
