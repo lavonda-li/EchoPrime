@@ -165,7 +165,7 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
     """Flush batch results, failures, and update progress trackers."""
 
     processed_files: List[str] = []
-    processed_dirs   = set(results_per_dir.keys()) | set(failed_per_dir.keys())
+    # processed_dirs   = set(results_per_dir.keys()) | set(failed_per_dir.keys())
 
     # 1. successes
     for rel_dir, res in list(results_per_dir.items()):
@@ -196,6 +196,9 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
         failed_per_dir.pop(rel_dir, None)
 
     # 3. record processed files
+    successes = sum(len(res) for res in results_per_dir.values())
+    failures = sum(len(fails) for fails in failed_per_dir.values())
+    print(f"🔔 {successes:,} successes, {failures:,} failures in this batch.")
     if processed_files:
         with PROCESSED_DCM_FILE.open("a") as pf:
             for pth in processed_files:
@@ -204,29 +207,29 @@ def _flush(results_per_dir: Dict[str, Dict[str, Any]],
                     PROCESSED_DCMS.add(pth)
 
     # 4. directory completion check
-    for rel_dir in processed_dirs:
-        if rel_dir in DONE_DIRS:
-            continue
-        out_dir = OUTPUT_ROOT / rel_dir
-        total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
-        successes = 0
-        res_file = out_dir / "results.json"
-        if res_file.exists():
-            with res_file.open() as f:
-                successes = len(json.load(f))
-        failures = 0
-        fail_file = out_dir / "failed.txt"
-        if fail_file.exists():
-            with fail_file.open() as f:
-                failures = sum(1 for _ in f)
+    # for rel_dir in processed_dirs:
+    #     if rel_dir in DONE_DIRS:
+    #         continue
+    #     out_dir = OUTPUT_ROOT / rel_dir
+    #     total_dcm = sum(1 for _ in (MOUNT_ROOT / rel_dir).glob("*.dcm"))
+    #     successes = 0
+    #     res_file = out_dir / "results.json"
+    #     if res_file.exists():
+    #         with res_file.open() as f:
+    #             successes = len(json.load(f))
+    #     failures = 0
+    #     fail_file = out_dir / "failed.txt"
+    #     if fail_file.exists():
+    #         with fail_file.open() as f:
+    #             failures = sum(1 for _ in f)
 
-        print(f"{rel_dir}: success={successes}, fail={failures}, total={total_dcm}")
+    #     print(f"{rel_dir}: success={successes}, fail={failures}, total={total_dcm}")
 
-        if successes + failures >= total_dcm > 0:
-            with DONE_DIRS_FILE.open("a") as df:
-                df.write(rel_dir + "\n")
-            DONE_DIRS.add(rel_dir)
-            print(f"🏁  {rel_dir} marked complete.")
+    #     if successes + failures >= total_dcm > 0:
+    #         with DONE_DIRS_FILE.open("a") as df:
+    #             df.write(rel_dir + "\n")
+    #         DONE_DIRS.add(rel_dir)
+    #         print(f"🏁  {rel_dir} marked complete.")
 
 if __name__ == "__main__":
     assert HAS_CUDA, "CUDA is required for this script."
