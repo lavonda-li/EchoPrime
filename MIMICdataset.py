@@ -36,9 +36,9 @@ DEVICE = torch.device("cuda")
 
 # Tune these to fill ≈ 80 % of 24 GB L4 mem
 BATCH_SIZE  = 1
-NUM_WORKERS = min(28, (os.cpu_count() or 32) - 4)
+NUM_WORKERS = 28
 PREFETCH    = 16
-FLUSH_EVERY = 16
+FLUSH_EVERY = 1
 
 FRAMES_TAKE, FRAME_STRIDE, SIZE = 32, 2, 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3,1,1,1)
