@@ -28,10 +28,10 @@ MANIFEST_FILE      = Path("manifest.json")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 192))          # ≈80 % L4 mem
-NUM_WORKERS = min(28, (os.cpu_count() or 32) - 4)
+BATCH_SIZE  = 16
+NUM_WORKERS = 24
 PREFETCH    = 16
-FLUSH_EVERY = 100
+FLUSH_EVERY = 1
 
 FRAMES_TAKE, SIZE = 32, 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3,1,1,1)
@@ -150,6 +150,7 @@ def _flush(res: Dict[str, Dict[str, Any]], fail: Dict[str, List[str]]):
         failc = sum(1 for _ in (OUTPUT_ROOT/rdir/"failed.txt").open()) if (OUTPUT_ROOT/rdir/"failed.txt").exists() else 0
         if succ + failc >= total > 0:
             DONE_DIRS_FILE.open("a").write(rdir+"\n"); DONE_DIRS.add(rdir)
+
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────
 
