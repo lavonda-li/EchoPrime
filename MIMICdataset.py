@@ -67,15 +67,16 @@ def classify_first_frames(batch: torch.Tensor) -> List[str]:
         logits = model(batch[:, :, 0])              # first frame only
     return [utils.COARSE_VIEWS[i] for i in logits.argmax(1).tolist()]
 
-# ─── RESUME STATE ─────────────────────────────────────────────────────────
-print("🔄  Loading resume state …")
-DONE_DIRS      = set(DONE_DIRS_FILE.read_text().splitlines()) if DONE_DIRS_FILE.exists() else set()
-PROCESSED_DCMS = set(PROCESSED_DCM_FILE.read_text().splitlines()) if PROCESSED_DCM_FILE.exists() else set()
-print(f"   ➜ {len(DONE_DIRS):,} dirs, {len(PROCESSED_DCMS):,} files already done.")
-
 # ─── DATASET ──────────────────────────────────────────────────────────────
 class EchoIterableDataset(IterableDataset):
     tv_resize = torchvision.transforms.Resize(SIZE, antialias=True)
+
+    def __init__(self):
+        # ─── RESUME STATE ─────────────────────────────────────────────────────────
+        print("🔄  Loading resume state …")
+        self.DONE_DIRS      = set(DONE_DIRS_FILE.read_text().splitlines()) if DONE_DIRS_FILE.exists() else set()
+        self.PROCESSED_DCMS = set(PROCESSED_DCM_FILE.read_text().splitlines()) if PROCESSED_DCM_FILE.exists() else set()
+        print(f"   ➜ {len(self.DONE_DIRS):,} dirs, {len(self.PROCESSED_DCMS):,} files already done.")
 
     @staticmethod
     def preprocess_tensor(px: np.ndarray) -> torch.Tensor:  # [T,H,W] or [T,H,W,1]
@@ -98,11 +99,11 @@ class EchoIterableDataset(IterableDataset):
             patients = patients[worker.id::worker.num_workers]
         for pat in patients:
             rel_pat = pat.relative_to(MOUNT_ROOT).as_posix()
-            if rel_pat in DONE_DIRS:
+            if rel_pat in self.DONE_DIRS:
                 continue
             for dcm_path in pat.rglob("*.dcm"):
                 rel_path = dcm_path.relative_to(MOUNT_ROOT).as_posix()
-                if rel_path in PROCESSED_DCMS:
+                if rel_path in self.PROCESSED_DCMS:
                     continue
                 try:
                     dcm = pydicom.dcmread(dcm_path, force=True)
@@ -150,8 +151,7 @@ def _flush(res_per_dir: Dict[str, Dict[str, Any]],
     # processed book-keep
     if processed:
         with PROCESSED_DCM_FILE.open("a") as pf:
-            pf.writelines(p + "\n" for p in processed if p not in PROCESSED_DCMS)
-            PROCESSED_DCMS.update(processed)
+            pf.writelines(p + "\n" for p in processed)
 
     # dir completion check
     for rdir in touched:
