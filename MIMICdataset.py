@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""MIMIC‑Echo‑IV view‑classification – optimized for a single NVIDIA L4
---------------------------------------------------------------------
-* Conditional DataParallel – auto‑no‑op on 1 GPU
-* Huge input‑pipeline: many DataLoader workers, large prefetch
-* FP16, channels‑last, TensorCore friendly, optional torch.compile
-* Batch increased – tune until GPU mem ≈ 80 %
-* Flush results every 100 batches to reduce FS overhead
-* Requires pylibjpeg (+ libjpeg‑turbo) for fast DICOM decode
+"""MIMIC‑Echo‑IV view‑classification – folder‑at‑a‑time batching
+-----------------------------------------------------------------
+Processes **all DICOMs in one folder as a single GPU batch**, then writes
+/ merges exactly one `results.json` + `failed.txt` for that folder.
+
+Advantages
+==========
+* No inter‑folder mixing ⇒ simpler bookkeeping.
+* Disk I/O drops to one write per folder.
+* Still leverages DataLoader workers for parallel decode.
+
+Caveat: very large folders must still fit in GPU memory. If you hit OOM,
+set `MAX_FOLDER_BATCH` (env or code) – the script will micro‑batch within
+that folder.
 """
 
 from __future__ import annotations
-import json, os, time, math
-from collections import defaultdict
+import json, os, math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -22,25 +27,22 @@ from tqdm import tqdm
 
 import utils, video_utils
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────
 MOUNT_ROOT  = Path(os.path.expanduser("~/mount-folder/MIMIC-Echo-IV"))
 OUTPUT_ROOT = Path(os.path.expanduser("~/inference_output")); OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 DONE_DIRS_FILE     = Path("done_dirs.txt")
 PROCESSED_DCM_FILE = Path("processed_dcms.txt")
 
-DEVICE = torch.device("cuda")
+DEVICE        = torch.device("cuda", 0)
+MAX_FOLDER_BATCH = 128
+NUM_WORKERS     = 28
+PREFETCH        = 4   # few folders in flight
 
-# Tune these to fill ≈ 80 % of 24 GB L4 mem
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 192))
-NUM_WORKERS = min(28, (os.cpu_count() or 32) - 4)
-PREFETCH    = 16
-FLUSH_EVERY = 100
+FRAMES_TAKE, SIZE = 32, 224
+MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3, 1, 1, 1)
+STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3, 1, 1, 1)
 
-FRAMES_TAKE, FRAME_STRIDE, SIZE = 32, 2, 224
-MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3,1,1,1)
-STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3,1,1,1)
-
-# ─── MODEL ────────────────────────────────────────────────────────────────
+# ─── MODEL ───────────────────────────────────────────────────────────────
 ckpt  = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
 state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
 model = torchvision.models.convnext_base()
@@ -50,149 +52,157 @@ model.load_state_dict(state, strict=False)
 model = model.to(DEVICE).half().eval()
 if torch.__version__ >= "2":
     model = torch.compile(model)
-
-# Automatic multi‑GPU support
 if torch.cuda.device_count() > 1:
     model = torch.nn.DataParallel(model)
 
 _autocast = torch.cuda.amp.autocast
 
 @torch.inference_mode()
-def classify_first_frames(batch: torch.Tensor) -> List[str]:
+def classify_first_frames(tensor_bcthw: torch.Tensor) -> List[str]:
     with _autocast(dtype=torch.float16):
-        logits = model(batch[:, :, 0])              # first frame only
+        logits = model(tensor_bcthw[:, :, 0])
     return [utils.COARSE_VIEWS[i] for i in logits.argmax(1).tolist()]
 
-# ─── RESUME STATE ─────────────────────────────────────────────────────────
-print("🔄  Loading resume state …")
+# ─── RESUME STATE ────────────────────────────────────────────────────────
 DONE_DIRS      = set(DONE_DIRS_FILE.read_text().splitlines()) if DONE_DIRS_FILE.exists() else set()
 PROCESSED_DCMS = set(PROCESSED_DCM_FILE.read_text().splitlines()) if PROCESSED_DCM_FILE.exists() else set()
-print(f"   ➜ {len(DONE_DIRS):,} dirs, {len(PROCESSED_DCMS):,} files already done.")
 
-# ─── DATASET ──────────────────────────────────────────────────────────────
-class EchoIterableDataset(IterableDataset):
+# ─── DATASET ─────────────────────────────────────────────────────────────
+class EchoFolderDataset(IterableDataset):
+    """Yields one tuple (vids, metas, keys, rel_dir) **per folder**."""
+
     tv_resize = torchvision.transforms.Resize(SIZE, antialias=True)
 
     @staticmethod
-    def preprocess_tensor(px: np.ndarray) -> torch.Tensor:  # [T,H,W] or [T,H,W,1]
+    def preprocess_tensor(px: np.ndarray) -> torch.Tensor:
         if px.ndim == 3:
             px = px[..., None]
-        vid = torch.from_numpy(px).permute(0,3,1,2).float()   # [T,3,H,W]
-        vid = EchoIterableDataset.tv_resize(vid)
-        vid = torchvision.transforms.functional.center_crop(vid, (SIZE,SIZE))
-        t_pad = max(0, FRAMES_TAKE - vid.size(0))
-        if t_pad:
-            vid = torch.cat((vid, torch.zeros(t_pad, 3, SIZE, SIZE)), 0)
-        vid = vid[:FRAMES_TAKE].permute(1,0,2,3)             # [C,T,H,W]
-        vid = (vid - MEAN).div_(STD)
-        return vid.half()
+        vid = torch.from_numpy(px).permute(0, 3, 1, 2).float()
+        vid = EchoFolderDataset.tv_resize(vid)
+        vid = torchvision.transforms.functional.center_crop(vid, (SIZE, SIZE))
+        if vid.size(0) < FRAMES_TAKE:
+            vid = torch.cat((vid, torch.zeros(FRAMES_TAKE - vid.size(0), 3, SIZE, SIZE)), 0)
+        vid = vid[:FRAMES_TAKE].permute(1, 0, 2, 3)
+        return (vid - MEAN).div_(STD).half()
 
     def __iter__(self):
-        worker = torch.utils.data.get_worker_info()
-        patients = sorted([p for p in MOUNT_ROOT.iterdir() if p.is_dir()])
-        if worker is not None:
-            patients = patients[worker.id::worker.num_workers]
+        info = torch.utils.data.get_worker_info()
+        patients = sorted(p for p in MOUNT_ROOT.iterdir() if p.is_dir())
+        if info is not None:
+            patients = patients[info.id::info.num_workers]
+
         for pat in patients:
-            rel_pat = pat.relative_to(MOUNT_ROOT).as_posix()
-            if rel_pat in DONE_DIRS:
+            rel_dir = pat.relative_to(MOUNT_ROOT).as_posix()
+            if rel_dir in DONE_DIRS:
                 continue
+
+            vids, metas, keys = [], [], []
             for dcm_path in pat.rglob("*.dcm"):
                 rel_path = dcm_path.relative_to(MOUNT_ROOT).as_posix()
                 if rel_path in PROCESSED_DCMS:
                     continue
                 try:
                     dcm = pydicom.dcmread(dcm_path, force=True)
-                    px  = dcm.pixel_array  # fast via pylibjpeg plugin
+                    px  = dcm.pixel_array
                     if px.ndim < 3 or (px.ndim == 3 and px.shape[-1] == 3):
                         raise ValueError("invalid pixel array shape")
-                    px = video_utils.mask_outside_ultrasound(px)
-                    vid = self.preprocess_tensor(px)
-                    meta = {el.name: el.repval for el in dcm}
-                    rel_dir = dcm_path.parent.relative_to(MOUNT_ROOT).as_posix()
-                    yield vid, meta, rel_path, rel_dir
+                    px  = video_utils.mask_outside_ultrasound(px)
+                    vids.append(self.preprocess_tensor(px))
+                    metas.append({el.name: el.repval for el in dcm})
+                    keys.append(rel_path)
                 except Exception:
-                    continue
+                    keys.append(rel_path)
+                    vids.append(None)  # placeholder for fail
+                    metas.append(None)
+            if vids:
+                yield vids, metas, keys, rel_dir
 
-# ─── UTILITIES ────────────────────────────────────────────────────────────
+# ─── HELPERS ─────────────────────────────────────────────────────────────
 
-def _one_thread(_: int):
+def _write_folder(rel_dir: str, results: Dict[str, Any], fails: List[str]):
+    out_dir = OUTPUT_ROOT / rel_dir; out_dir.mkdir(parents=True, exist_ok=True)
+
+    # results.json (merge)
+    r_path = out_dir / "results.json"
+    merged = {}
+    if r_path.exists():
+        try:
+            with r_path.open() as f:
+                merged = json.load(f)
+        except Exception:
+            merged = {}
+    merged.update(results)
+    if merged:
+        with r_path.open("w") as f:
+            json.dump(merged, f)
+
+    # failed.txt (merge)
+    f_path = out_dir / "failed.txt"
+    merged_f = set(fails)
+    if f_path.exists():
+        try:
+            with f_path.open() as f:
+                merged_f |= {ln.strip() for ln in f if ln.strip()}
+        except Exception:
+            pass
+    if merged_f:
+        with f_path.open("w") as f:
+            for k in sorted(merged_f):
+                f.write(f"{k}\n")
+
+    # book‑keeping files
+    with PROCESSED_DCM_FILE.open("a") as pf:
+        for p in list(results.keys()) + list(merged_f):
+            if p not in PROCESSED_DCMS:
+                pf.write(p + "\n"); PROCESSED_DCMS.add(p)
+    with DONE_DIRS_FILE.open("a") as df:
+        df.write(rel_dir + "\n"); DONE_DIRS.add(rel_dir)
+
+    print(f"🏁  {rel_dir} done – wrote/merged in one go.")
+
+# ─── MAIN ────────────────────────────────────────────────────────────────
+
+def _init_worker(_: int):
     torch.set_num_threads(1)
 
-# flush helpers
 
-def _flush(res_per_dir: Dict[str, Dict[str, Any]],
-           fail_per_dir: Dict[str, List[str]]):
-    processed: List[str] = []
-    touched = set(res_per_dir) | set(fail_per_dir)
+def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
-    # successes
-    for rdir, res in list(res_per_dir.items()):
-        out_dir = OUTPUT_ROOT / rdir; out_dir.mkdir(parents=True, exist_ok=True)
-        out_file = out_dir / "results.json"
-        data = res
-        if out_file.exists():
-            with out_file.open() as f: data |= json.load(f)
-        with out_file.open("w") as f: json.dump(data, f)
-        processed.extend(res.keys()); res_per_dir.pop(rdir, None)
-
-    # failures
-    for rdir, fl in list(fail_per_dir.items()):
-        out_dir = OUTPUT_ROOT / rdir; out_dir.mkdir(parents=True, exist_ok=True)
-        fail_file = out_dir / "failed.txt"
-        with fail_file.open("a") as f:
-            f.writelines(k + "\n" for k in fl)
-        processed.extend(fl); fail_per_dir.pop(rdir, None)
-
-    # processed book‑keep
-    if processed:
-        with PROCESSED_DCM_FILE.open("a") as pf:
-            pf.writelines(p + "\n" for p in processed if p not in PROCESSED_DCMS)
-            PROCESSED_DCMS.update(processed)
-
-    # dir completion check
-    for rdir in touched:
-        if rdir in DONE_DIRS: continue
-        total = sum(1 for _ in (MOUNT_ROOT/rdir).glob("*.dcm"))
-        succ  = len(json.load(open(OUTPUT_ROOT/rdir/"results.json"))) if (OUTPUT_ROOT/rdir/"results.json").exists() else 0
-        fail  = sum(1 for _ in open(OUTPUT_ROOT/rdir/"failed.txt")) if (OUTPUT_ROOT/rdir/"failed.txt").exists() else 0
-        if succ + fail >= total > 0:
-            with DONE_DIRS_FILE.open("a") as df:
-                df.write(rdir + "\n"); DONE_DIRS.add(rdir)
-
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────
-
-def main() -> None:
-    ds = EchoIterableDataset()
+    ds = EchoFolderDataset()
     dl = DataLoader(ds,
-                    batch_size=BATCH_SIZE,
+                    batch_size=None,            # dataset already returns a folder
                     num_workers=NUM_WORKERS,
                     pin_memory=True,
                     persistent_workers=True,
                     prefetch_factor=PREFETCH,
-                    collate_fn=lambda x: tuple(zip(*x)),
-                    worker_init_fn=_one_thread)
+                    collate_fn=lambda x: x[0],  # unwrap the single item list
+                    worker_init_fn=_init_worker)
 
-    res_per_dir: Dict[str, Dict[str, Any]] = defaultdict(dict)
-    fail_per_dir: Dict[str, List[str]]      = defaultdict(list)
+    for vids, metas, keys, rel_dir in tqdm(dl, unit="folder"):
+        # split fails vs good vids
+        ok_indices = [i for i, v in enumerate(vids) if v is not None]
+        fail_paths = [keys[i] for i, v in enumerate(vids) if v is None]
 
-    for batch_idx, (vids, metas, keys, dirs) in enumerate(tqdm(dl, unit="batch")):
-        vids_dev = torch.stack(list(vids)).to(
-            DEVICE, non_blocking=True, memory_format=torch.channels_last)
-        try:
-            views = classify_first_frames(vids_dev)
-        except Exception:
-            for k, d in zip(keys, dirs): fail_per_dir[d].append(k)
-        else:
-            for k, m, v, d in zip(keys, metas, views, dirs):
-                res_per_dir[d][k] = {"metadata": m, "predicted_view": v}
+        results: Dict[str, Any] = {}
+        if ok_indices:
+            # optional micro‑batching if folder is huge
+            step = MAX_FOLDER_BATCH or len(ok_indices)
+            preds: List[str] = []
+            for i in range(0, len(ok_indices), step):
+                idx_chunk = ok_indices[i:i+step]
+                tensor = torch.stack([vids[j] for j in idx_chunk]).to(
+                    DEVICE, non_blocking=True, memory_format=torch.channels_last)
+                preds.extend(classify_first_frames(tensor))
 
-        if (batch_idx + 1) % FLUSH_EVERY == 0:
-            _flush(res_per_dir, fail_per_dir)
+            for idx, view in zip(ok_indices, preds):
+                results[keys[idx]] = {"metadata": metas[idx], "predicted_view": view}
 
-    _flush(res_per_dir, fail_per_dir)
-    print("✅  All done!")
+        _write_folder(rel_dir, results, fail_paths)
+
+    print("✅  All folders processed – job complete.")
+
 
 if __name__ == "__main__":
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     main()
