@@ -28,7 +28,7 @@ MANIFEST_FILE      = Path("manifest.json")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE  = 16
+BATCH_SIZE  = 64
 NUM_WORKERS = 24
 PREFETCH    = 16
 FLUSH_EVERY = 1
@@ -129,6 +129,7 @@ def _one_thread(_: int):
     torch.set_num_threads(1)
 
 def _flush(res: Dict[str, Dict[str, Any]], fail: Dict[str, List[str]]):
+    # print number of successes and failures
     processed = []
     touched = set(res) | set(fail)
     for rdir, items in list(res.items()):
@@ -142,15 +143,15 @@ def _flush(res: Dict[str, Dict[str, Any]], fail: Dict[str, List[str]]):
         fp = (out_dir / "failed.txt").open("a"); fp.writelines(p+"\n" for p in lst); fp.close()
         processed.extend(lst); fail.pop(rdir)
     if processed:
-        PROCESSED_DCM_FILE.open("a").writelines(p+"\n" for p in processed if p not in PROCESSED_DCMS)
+        PROCESSED_DCM_FILE.open("a").writelines(p+"\n" for p in processed)
         PROCESSED_DCMS.update(processed)
     for rdir in touched - DONE_DIRS:
         total = TOTALS_BY_DIR.get(rdir, 0)
         succ  = len(json.load((OUTPUT_ROOT/rdir/"results.json").open())) if (OUTPUT_ROOT/rdir/"results.json").exists() else 0
         failc = sum(1 for _ in (OUTPUT_ROOT/rdir/"failed.txt").open()) if (OUTPUT_ROOT/rdir/"failed.txt").exists() else 0
+        print(f"   ➜ {rdir}: {succ:,} successes, {failc:,} failures, {total:,}")
         if succ + failc >= total > 0:
             DONE_DIRS_FILE.open("a").write(rdir+"\n"); DONE_DIRS.add(rdir)
-
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────
 
