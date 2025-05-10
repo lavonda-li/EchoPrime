@@ -20,6 +20,8 @@ import json, os, math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from matplotlib.pylab import f
+
 import torch, torchvision
 import numpy as np, pydicom
 from torch.utils.data import IterableDataset, DataLoader
@@ -66,6 +68,7 @@ def classify_first_frames(tensor_bcthw: torch.Tensor) -> List[str]:
 # ─── RESUME STATE ────────────────────────────────────────────────────────
 DONE_DIRS      = set(DONE_DIRS_FILE.read_text().splitlines()) if DONE_DIRS_FILE.exists() else set()
 PROCESSED_DCMS = set(PROCESSED_DCM_FILE.read_text().splitlines()) if PROCESSED_DCM_FILE.exists() else set()
+print(f"🗂️  {len(DONE_DIRS)} folders already done, {len(PROCESSED_DCMS)} DCMs processed.")
 
 # ─── DATASET ─────────────────────────────────────────────────────────────
 class EchoFolderDataset(IterableDataset):
