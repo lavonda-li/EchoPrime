@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""MIMIC-Echo-IV view-classification – fast inference edition
+"""MIMIC‑Echo‑IV view‑classification – fast inference edition
 ────────────────────────────────────────────────────────────────────────
-• One-shot manifest (cached) eliminates repeated directory walks
-• Vectorised skip of already-processed paths
-• PyTorch rank-mismatch fixed (channels_last only on 4-D tensors)
-• `--profile` flag prints per-batch timings; final summary always printed
+• One‑shot manifest (cached) eliminates repeated directory walks
+• Vectorised skip of already‑processed paths
+• Robust to `torch.compile` issues – auto‑fallback to eager if Dynamo fails
+• Prints a log line **every time something is written to disk** (manifest,
+  per‑dir results, failure logs, processed list, done‑dir flag) so you can
+  monitor I/O behaviour in real‑time.
+
+Set `NO_COMPILE=1` in the environment to skip `torch.compile` entirely.
 """
 from __future__ import annotations
-import json, os, time, argparse
+import json, os, time, argparse, sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -37,6 +41,12 @@ FRAMES_TAKE, SIZE = 32, 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3,1,1,1)
 STD  = torch.tensor([47.989223, 46.456997, 47.200830]).reshape(3,1,1,1)
 
+# ─── HELPER: logging writes ───────────────────────────────────────────────
+
+def _log_write(path: Path | str, note: str = "") -> None:
+    """Print a single line to stdout whenever we touch the filesystem."""
+    print(f"💾  {note} -> {path}", file=sys.stderr)
+
 # ─── MODEL ────────────────────────────────────────────────────────────────
 ckpt  = torch.load("model_data/weights/view_classifier.ckpt", map_location="cpu")
 state = {k[6:]: v for k, v in ckpt["state_dict"].items()}
@@ -45,15 +55,23 @@ model.classifier[-1] = torch.nn.Linear(model.classifier[-1].in_features,
                                        len(utils.COARSE_VIEWS))
 model.load_state_dict(state, strict=False)
 model = model.to(DEVICE).half().eval()
-if torch.__version__ >= "2":
-    model = torch.compile(model)
+
+if DEVICE.type == "cuda" and torch.__version__ >= "2" and os.getenv("NO_COMPILE", "0") != "1":
+    try:
+        model = torch.compile(model, backend="inductor")
+    except Exception as e:
+        print(f"⚠️  torch.compile failed ({e.__class__.__name__}: {e}). Running eager.")
+else:
+    if os.getenv("NO_COMPILE", "0") == "1":
+        print("ℹ️  Skipping torch.compile because NO_COMPILE=1")
+
 if DEVICE.type == "cuda" and torch.cuda.device_count() > 1:
     model = torch.nn.DataParallel(model)
+
 _autocast = torch.cuda.amp.autocast if DEVICE.type == "cuda" else torch.cpu.amp.autocast
 
 @torch.inference_mode()
 def classify_first_frames(batch_5d: torch.Tensor) -> List[str]:
-    """Input `[B,C,T,H,W]` on DEVICE → list[str] coarse views."""
     with _autocast(dtype=torch.float16):
         x = batch_5d[:, :, 0].contiguous(memory_format=torch.channels_last)
         logits = model(x)
@@ -70,10 +88,11 @@ print("🔍  Building / loading manifest …", end=" ")
 if MANIFEST_FILE.exists():
     man = json.load(MANIFEST_FILE.open())
     ALL_DCMS      = [MOUNT_ROOT / p for p in man["all_dcms"]]
-    TOTALS_BY_DIR = man["totals_by_dir"]
+    TOTALS_BY_DIR: Dict[str,int] = man["totals_by_dir"]
     print("cached ✅")
 else:
-    ALL_DCMS, TOTALS_BY_DIR = [], defaultdict(int)
+    ALL_DCMS: List[Path] = []
+    TOTALS_BY_DIR = defaultdict(int)
     for p in tqdm(MOUNT_ROOT.rglob("*.dcm"), desc=" scan", unit="file"):
         TOTALS_BY_DIR[p.parent.relative_to(MOUNT_ROOT).as_posix()] += 1
         ALL_DCMS.append(p)
@@ -81,6 +100,7 @@ else:
         "all_dcms"     : [p.relative_to(MOUNT_ROOT).as_posix() for p in ALL_DCMS],
         "totals_by_dir": TOTALS_BY_DIR,
     }))
+    _log_write(MANIFEST_FILE, "manifest saved")
     print("new ✅")
 
 TO_DO = [p for p in ALL_DCMS if p.relative_to(MOUNT_ROOT).as_posix() not in PROCESSED_DCMS]
@@ -101,8 +121,7 @@ class EchoIterableDataset(IterableDataset):
         vid = EchoIterableDataset.resize(vid)
         vid = torchvision.transforms.functional.center_crop(vid, (SIZE,SIZE))
         if vid.size(0) < FRAMES_TAKE:
-            pad = torch.zeros(FRAMES_TAKE - vid.size(0), 3, SIZE, SIZE)
-            vid = torch.cat((vid, pad), 0)
+            vid = torch.cat((vid, torch.zeros(FRAMES_TAKE - vid.size(0), 3, SIZE, SIZE)), 0)
         vid = vid[:FRAMES_TAKE].permute(1,0,2,3)
         vid = (vid - MEAN).div_(STD)
         return vid.half()
@@ -121,7 +140,7 @@ class EchoIterableDataset(IterableDataset):
                 px = video_utils.mask_outside_ultrasound(px)
                 yield EchoIterableDataset.preprocess(px), {el.name: el.repval for el in dcm}, rel_path, rel_dir
             except Exception:
-                yield None, None, rel_path, rel_dir  # mark failure
+                yield None, None, rel_path, rel_dir
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────
 
@@ -129,22 +148,29 @@ def _one_thread(_: int):
     torch.set_num_threads(1)
 
 def _flush(res: Dict[str, Dict[str, Any]], fail: Dict[str, List[str]]):
-    # print number of successes and failures
     processed = []
     touched = set(res) | set(fail)
+
     for rdir, items in list(res.items()):
         out_dir = OUTPUT_ROOT / rdir; out_dir.mkdir(parents=True, exist_ok=True)
         out_file = out_dir / "results.json"
         data = items | (json.load(out_file.open()) if out_file.exists() else {})
         json.dump(data, out_file.open("w"))
+        _log_write(out_file, f"results ({len(items)})")
         processed.extend(items.keys()); res.pop(rdir)
+
     for rdir, lst in list(fail.items()):
         out_dir = OUTPUT_ROOT / rdir; out_dir.mkdir(parents=True, exist_ok=True)
-        fp = (out_dir / "failed.txt").open("a"); fp.writelines(p+"\n" for p in lst); fp.close()
+        fail_fp = out_dir / "failed.txt"
+        fail_fp.open("a").writelines(p+"\n" for p in lst)
+        _log_write(fail_fp, f"failures (+{len(lst)})")
         processed.extend(lst); fail.pop(rdir)
+
     if processed:
-        PROCESSED_DCM_FILE.open("a").writelines(p+"\n" for p in processed)
+        PROCESSED_DCM_FILE.open("a").writelines(p+"\n" for p in processed if p not in PROCESSED_DCMS)
+        _log_write(PROCESSED_DCM_FILE, f"update (+{len(processed)})")
         PROCESSED_DCMS.update(processed)
+
     for rdir in touched - DONE_DIRS:
         total = TOTALS_BY_DIR.get(rdir, 0)
         succ  = len(json.load((OUTPUT_ROOT/rdir/"results.json").open())) if (OUTPUT_ROOT/rdir/"results.json").exists() else 0
