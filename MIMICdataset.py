@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""MIMIC‑Echo‑IV view‑classification – optimized for a single NVIDIA L4
+"""MIMIC-Echo-IV view-classification – optimized for a single NVIDIA L4
 --------------------------------------------------------------------
-* Conditional DataParallel – auto‑no‑op on 1 GPU
-* Huge input‑pipeline: many DataLoader workers, large prefetch
-* FP16, channels‑last, TensorCore friendly, optional torch.compile
-* Batch increased – tune until GPU mem ≈ 80 %
+* Conditional DataParallel – auto-no-op on 1 GPU
+* Huge input-pipeline: many DataLoader workers, large prefetch
+* FP16, channels-last, TensorCore friendly, optional torch.compile
+* Batch increased – tune until GPU mem ≈ 80 %
 * Flush results every 100 batches to reduce FS overhead
-* Requires pylibjpeg (+ libjpeg‑turbo) for fast DICOM decode
+* Requires pylibjpeg (+ libjpeg-turbo) for fast DICOM decode
+*
+* This version adds lightweight wall-clock profiling with per-batch
+  breakdown (data-load / GPU inference / post-processing / flush).
+  A final summary table is printed at the end.
 """
 
 from __future__ import annotations
-import json, os, time, math
+import json, os, time, math, argparse
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -30,11 +34,11 @@ PROCESSED_DCM_FILE = Path("processed_dcms.txt")
 
 DEVICE = torch.device("cuda")
 
-# Tune these to fill ≈ 80 % of 24 GB L4 mem
-BATCH_SIZE  = int(os.getenv("BATCH_SIZE", 192))
+# Tune these to fill ≈ 80 % of 24 GB L4 mem
+BATCH_SIZE  = 1
 NUM_WORKERS = min(28, (os.cpu_count() or 32) - 4)
 PREFETCH    = 16
-FLUSH_EVERY = 100
+FLUSH_EVERY = 16
 
 FRAMES_TAKE, FRAME_STRIDE, SIZE = 32, 2, 224
 MEAN = torch.tensor([29.110628, 28.076836, 29.096405]).reshape(3,1,1,1)
@@ -51,7 +55,7 @@ model = model.to(DEVICE).half().eval()
 if torch.__version__ >= "2":
     model = torch.compile(model)
 
-# Automatic multi‑GPU support
+# Automatic multi-GPU support
 if torch.cuda.device_count() > 1:
     model = torch.nn.DataParallel(model)
 
@@ -143,7 +147,7 @@ def _flush(res_per_dir: Dict[str, Dict[str, Any]],
             f.writelines(k + "\n" for k in fl)
         processed.extend(fl); fail_per_dir.pop(rdir, None)
 
-    # processed book‑keep
+    # processed book-keep
     if processed:
         with PROCESSED_DCM_FILE.open("a") as pf:
             pf.writelines(p + "\n" for p in processed if p not in PROCESSED_DCMS)
@@ -162,6 +166,10 @@ def _flush(res_per_dir: Dict[str, Dict[str, Any]],
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="MIMIC-Echo-IV view-classifier with timing profile")
+    parser.add_argument("--profile", action="store_true", help="Print detailed per-batch timings (slow!)")
+    args = parser.parse_args()
+
     ds = EchoIterableDataset()
     dl = DataLoader(ds,
                     batch_size=BATCH_SIZE,
@@ -175,22 +183,67 @@ def main() -> None:
     res_per_dir: Dict[str, Dict[str, Any]] = defaultdict(dict)
     fail_per_dir: Dict[str, List[str]]      = defaultdict(list)
 
+    # ─── PROFILING STATE ────────────────────────────────────────────────
+    n_batches = 0
+    t_tot = time.perf_counter()
+    t_dl = t_inf = t_post = t_flush = 0.0
+    t_prev = t_tot  # marks end of previous iteration
+
     for batch_idx, (vids, metas, keys, dirs) in enumerate(tqdm(dl, unit="batch")):
+        now = time.perf_counter()
+        t_dl += now - t_prev  # time spent waiting for DataLoader
+        n_batches += 1
+
+        # GPU inference
         vids_dev = torch.stack(list(vids)).to(
             DEVICE, non_blocking=True, memory_format=torch.channels_last)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         try:
             views = classify_first_frames(vids_dev)
+            torch.cuda.synchronize()
         except Exception:
             for k, d in zip(keys, dirs): fail_per_dir[d].append(k)
-        else:
+            views = None
+        t_inf += time.perf_counter() - t0
+
+        # post-processing
+        t1 = time.perf_counter()
+        if views is not None:
             for k, m, v, d in zip(keys, metas, views, dirs):
                 res_per_dir[d][k] = {"metadata": m, "predicted_view": v}
+        t_post += time.perf_counter() - t1
 
+        # flush every FLUSH_EVERY
         if (batch_idx + 1) % FLUSH_EVERY == 0:
+            t2 = time.perf_counter()
             _flush(res_per_dir, fail_per_dir)
+            t_flush += time.perf_counter() - t2
 
+        t_prev = time.perf_counter()
+
+        # optional verbose per-batch timings
+        if args.profile:
+            print(f"Batch {batch_idx:>5d}: DL={t_dl/n_batches:.4f}s  INF={t_inf/n_batches:.4f}s  "
+                  f"POST={t_post/n_batches:.4f}s  FLUSH={t_flush/max(1, batch_idx//FLUSH_EVERY+1):.4f}s")
+
+    # final flush + timings
+    t2 = time.perf_counter()
     _flush(res_per_dir, fail_per_dir)
-    print("✅  All done!")
+    t_flush += time.perf_counter() - t2
+    t_tot = time.perf_counter() - t_tot
+
+    # ─── SUMMARY ────────────────────────────────────────────────────────
+    print("\n─────────── PROFILE SUMMARY ───────────")
+    print(f"Batches processed       : {n_batches}")
+    print(f"Total runtime           : {t_tot:9.2f} s")
+    print(f"Avg. batch   throughput : {n_batches / t_tot:9.2f} batches/s")
+    if n_batches:
+        print(f"Avg. data-load time     : {t_dl / n_batches:9.4f} s")
+        print(f"Avg. GPU inference time : {t_inf / n_batches:9.4f} s")
+        print(f"Avg. post-proc time     : {t_post / n_batches:9.4f} s")
+    print(f"Total flush time        : {t_flush:9.2f} s  (every {FLUSH_EVERY} batches)")
+    print("✅  All done! ──────────────────────────")
 
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
